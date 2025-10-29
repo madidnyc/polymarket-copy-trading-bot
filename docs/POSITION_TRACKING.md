@@ -1,138 +1,113 @@
 # Position Tracking System
 
-## Проблема
+## Problem
 
-Когда вы пополняете свой счет после покупки позиции, при продаже этой позиции бот может продать неправильное количество токенов, потому что расчет основывается на текущем балансе, а не на фактически купленном количестве.
+If you top up your wallet after buying a position, later sells can be mis-sized. The naive approach scales sells off your **current** balance instead of the **quantity actually purchased**, so the bot could sell too many or too few tokens when traders scale in/out.
 
-### Пример проблемы:
+### Example
 
-1. У вас баланс $100, у трейдера $500
-2. Трейдер покупает на $50 → вы покупаете на $10 (пропорционально 20%)
-3. **Вы пополняете баланс до $500**
-4. Трейдер продает 50% позиции
-5. **Старая логика**: продаст 50% от текущей позиции (неправильно)
-6. **Новая логика**: продаст 50% от фактически купленных токенов (правильно)
+1. You have $100, trader has $500
+2. Trader buys $50 → you buy $10 (20% of their size)
+3. You add funds and your balance jumps to $500
+4. Trader sells 50% of their position
+5. **Old logic**: sells 50% of your current balance (wrong)
+6. **New logic**: sells 50% of the tokens you actually bought (correct)
 
-## Решение
+## Solution
 
-Система отслеживания покупок запоминает фактическое количество купленных токенов и использует эту информацию при продаже.
+We track how many tokens were purchased in each buy and use that figure when selling.
 
-### Как это работает:
+### Buy flow
 
-#### 1. При покупке (BUY)
+1. Calculate proportional order size
+2. After a successful POST, record the actual token amount (`myBoughtSize`)
+3. Persist `myBoughtSize` to MongoDB alongside the trade entry
 
-- Бот рассчитывает пропорциональный размер ордера от текущего баланса
-- **После успешной покупки** сохраняет фактическое количество купленных токенов в поле `myBoughtSize`
-- Это число сохраняется в базе данных MongoDB для каждой транзакции
+### Sell flow
 
-#### 2. При продаже (SELL)
+1. Query all prior buys for the same `asset` + `conditionId`
+2. Sum all tracked token amounts
+3. Compute the trader’s sell percentage
+4. Apply that percentage to the tracked tokens, not the current wallet holding
+5. After selling:
+   - If ≥99% sold, clear the tracking entries
+   - Otherwise, decrement each tracked buy proportionally
 
-- Бот загружает все предыдущие покупки для этого asset/conditionId
-- Суммирует все купленные токены (`myBoughtSize`)
-- Рассчитывает процент, который продает трейдер
-- **Применяет этот процент к фактически купленным токенам**, а не к текущей позиции
-- После продажи обновляет отслеживаемые покупки:
-    - Если продано ≥99% → очищает tracking полностью
-    - Если продано частично → пропорционально уменьшает `myBoughtSize` для всех покупок
+## Code Touchpoints
 
-## Изменения в коде
+### Data model (`userHistory.ts`)
 
-### 1. Модель данных (`userHistory.ts`)
-
-```typescript
-myBoughtSize: { type: Number, required: false } // Tracks actual tokens we bought
+```ts
+myBoughtSize: { type: Number, required: false } // actual tokens we bought
 ```
 
-### 2. Интерфейс (`User.ts`)
+### Interface (`interfaces/User.ts`)
 
-```typescript
-myBoughtSize?: number; // Tracks actual tokens we bought
+```ts
+myBoughtSize?: number;
 ```
 
-### 3. Логика покупки (`postOrder.ts`)
+### Buy logic (`utils/postOrder.ts`)
 
-- Отслеживает `totalBoughtTokens` во время покупки
-- Сохраняет это значение в базу: `{ myBoughtSize: totalBoughtTokens }`
-- Логирует для отладки: `📝 Tracked purchase: X.XX tokens`
+- Track `totalBoughtTokens` during the loop
+- Save `{ myBoughtSize: totalBoughtTokens }` once the trade is marked `bot: true`
+- Log the tracked amount for visibility
 
-### 4. Логика продажи (`postOrder.ts`)
+### Sell logic (`utils/postOrder.ts`)
 
-- Загружает предыдущие покупки:
-    ```typescript
-    const previousBuys = await UserActivity.find({
-        asset: trade.asset,
-        conditionId: trade.conditionId,
-        side: 'BUY',
-        bot: true,
-        myBoughtSize: { $exists: true, $gt: 0 },
-    });
-    ```
-- Рассчитывает от купленных токенов, а не от текущей позиции
-- Обновляет tracking после продажи
+- Fetch prior buys with `myBoughtSize > 0`
+- Calculate sell size from tracked tokens
+- Update or clear tracking based on how much was sold
 
-## Преимущества
+## Benefits
 
-1. ✅ **Правильные пропорции**: Продажа всегда пропорциональна фактически купленному
-2. ✅ **Независимость от пополнения**: Можно пополнять баланс в любое время
-3. ✅ **Точность**: Отслеживание реальных токенов, а не расчет от баланса
-4. ✅ **Прозрачность**: Видно в логах, сколько токенов отслеживается
-5. ✅ **Fallback**: Если нет tracked purchases, использует старую логику
+- ✅ Accurate proportional sells even after deposits
+- ✅ Decouples copy sizing from current balance
+- ✅ Transparent logs show how many tokens are tracked
+- ✅ Falls back to old behavior when no tracking data exists
 
-## Логи для отладки
+## Log Examples
 
-### При покупке:
-
+**Buy**
 ```
-✅ Bought $10.00 at $0.52 (19.23 tokens)
+✓ Bought $10.00 at $0.52 (19.23 tokens)
 📝 Tracked purchase: 19.23 tokens for future sell calculations
 ```
 
-### При продаже:
-
+**Sell (partial)**
 ```
 📊 Found 2 previous purchases: 35.45 tokens bought
 Calculating from tracked purchases: 35.45 × 50.00% = 17.72 tokens
-✅ Sold 17.72 tokens at $0.55
+✓ Sold 17.72 tokens at $0.55
 📝 Updated purchase tracking (sold 50.0% of tracked position)
 ```
 
-### При полной продаже:
-
+**Sell (full)**
 ```
 🧹 Cleared purchase tracking (sold 100.0% of position)
 ```
 
-## Обратная совместимость
+## Backward Compatibility
 
-- **Старые позиции** (без `myBoughtSize`): используется старая логика (расчет от текущей позиции)
-- **Новые позиции**: используется новая логика отслеживания
-- Предупреждение в логах: `⚠️ No tracked purchases found, using current position`
+- Existing trades without `myBoughtSize` will still use current-position sizing
+- New trades automatically record purchase sizes
+- Over time, all positions migrate to the tracking system
 
-## Миграция
+## Testing Checklist
 
-Никаких действий не требуется:
-
-- Существующие позиции продолжат работать со старой логикой
-- Новые покупки автоматически начнут отслеживаться
-- Постепенно все позиции перейдут на новую систему
-
-## Тестирование
-
-Для проверки работы:
-
-1. Купите позицию при балансе X
-2. Пополните баланс до Y (Y > X)
-3. Дождитесь продажи трейдером
-4. Проверьте логи - должны увидеть "📊 Found N previous purchases"
-5. Убедитесь, что продано правильное количество токенов
+1. Copy a buy with capital ratio X
+2. Top up wallet balance significantly
+3. Wait for trader to sell partially/fully
+4. Check logs for “Found previous purchases” and confirm correct amounts sold
 
 ## FAQ
 
-**Q: Что если я вручную продам часть позиции?**
-A: Система отслеживает только автоматические сделки бота. Ручные продажи не учитываются.
+**Q: What if I manually sell part of a position?**  
+A: Manual sells aren’t tracked; tracking only reflects bot-managed buys.
 
-**Q: Что если трейдер закрыл всю позицию?**
-A: Бот продаст всю вашу текущую позицию (не зависит от tracking).
+**Q: What if the trader exits completely?**  
+A: The bot sells your entire remaining position regardless of tracking data.
 
-**Q: Можно ли отключить эту функцию?**
-A: Нет необходимости - система автоматически fallback на старую логику если tracking недоступен.
+**Q: Can I disable tracking?**  
+A: There’s no toggle—when tracking data is missing, the bot automatically falls back to the previous behavior.
+

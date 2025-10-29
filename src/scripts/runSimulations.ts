@@ -205,6 +205,7 @@ async function main() {
             const trader = args[1];
             const days = parseInt(args[2] || '30');
             const multiplier = parseFloat(args[3] || '1.0');
+            const maxTradesEnv = process.env.SIM_MAX_TRADES ? parseInt(process.env.SIM_MAX_TRADES, 10) : undefined;
 
             if (!trader) {
                 console.log(colors.red('Error: Trader address required for custom mode'));
@@ -217,6 +218,7 @@ async function main() {
                 historyDays: days,
                 multiplier,
                 minOrderSize: 1.0,
+                maxTrades: maxTradesEnv,
                 tag: 'custom',
             });
             break;
